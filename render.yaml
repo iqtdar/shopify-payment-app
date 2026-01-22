@@ -1,0 +1,12 @@
+# render.yaml
+services:
+  - type: web
+    name: shopify-payment-capturer
+    env: node
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+    healthCheckPath: /health
+    autoDeploy: true
