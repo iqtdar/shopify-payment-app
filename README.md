@@ -18,4 +18,4 @@ A private Shopify app that captures payments based on order metadata flags (`buy
    ```bash
    git add .
    git commit -m "Initial commit"
-   git push origin main
+   git push origin main# shopify-payment-capturer
