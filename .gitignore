@@ -1,6 +1,8 @@
 # Dependencies
 node_modules/
 npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
 
 # Environment variables
 .env
@@ -10,53 +12,20 @@ npm-debug.log*
 .env.production.local
 
 # Runtime data
+logs/
+*.log
+*.pid
 .DS_Store
-Thumbs.db
 
-# IDE files
+# Coverage directory used by tools like istanbul
+coverage/
+.nyc_output/
+
+# IDE
 .vscode/
 .idea/
 *.swp
 *.swo
 
-# OS generated files
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
-[Tt]humbs.db
-
-# Logs
-*.log
-logs/
-
-# Temporary files
-tmp/
-temp/
-
-# Shell scripts with secrets
-*-token.sh
-setup-*.sh
-fix-*.sh
-deploy.sh
-EOF
-
-# Also check for any other files that might have secrets
-grep -r "shpss_" . 2>/dev/null || echo "No secrets found in remaining files"
-grep -r "e168581227968015c6876d3a1d84fc16" . 2>/dev/null || echo "No client ID found"
-
-# Create a template environment file
-cat > .env.example << 'EOF'
-# Shopify App Credentials (DO NOT commit real values!)
-SHOPIFY_SHOP_NAME=your-shop-name
-SHOPIFY_CLIENT_ID=your-client-id-here
-SHOPIFY_CLIENT_SECRET=your-client-secret-here
-
-# Server Configuration
-PORT=3000
-NODE_ENV=development
-
-# Scheduler Configuration
-CHECK_INTERVAL_HOURS=1
-PAY_LATER_DAYS=7
+# OS
+Thumbs.db

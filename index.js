@@ -1,381 +1,261 @@
-require('dotenv').config();
 const express = require('express');
-const app = express();
+const bodyParser = require('body-parser');
+const cors = require('cors');
 const shopifyService = require('./services/shopify');
-const webhookController = require('./controllers/webhooks');
-const scheduler = require('./services/scheduler');
+const { handleOrderCreate, handleOrderUpdate } = require('./controllers/webhooks');
 
-app.use(express.json());
+const app = express();
+const PORT = process.env.PORT || 3000;
 
-// Add production logging for Render
-if (process.env.NODE_ENV === 'production') {
-  console.log('🚀 Running in PRODUCTION mode on Render');
-  
-  // Force HTTPS in production (Render provides x-forwarded-proto)
-  app.use((req, res, next) => {
-    const isLocalhost = req.hostname === 'localhost' || req.hostname === '127.0.0.1';
-    const isSecure = req.secure || req.headers['x-forwarded-proto'] === 'https';
-    
-    if (!isLocalhost && !isSecure && process.env.NODE_ENV === 'production') {
-      return res.redirect(`https://${req.headers.host}${req.url}`);
-    }
-    next();
-  });
-}
+// Middleware
+app.use(cors());
+app.use(bodyParser.json());
 
-// Add debug middleware with better formatting
-app.use((req, res, next) => {
-  const timestamp = new Date().toISOString();
-  console.log(`[${timestamp}] ${req.method} ${req.url} - ${req.ip}`);
-  next();
-});
-
+// Initialize Shopify service
 try {
-  // Initialize Shopify client
   shopifyService.initializeClient();
-  console.log('✅ Shopify client initialized');
+  console.log('✅ Shopify service initialized');
 } catch (error) {
-  console.error('❌ Failed to initialize Shopify client:', error.message);
-  process.exit(1);
+  console.error('❌ Failed to initialize Shopify service:', error.message);
 }
 
-// === ROUTES ===
-
-// Health check endpoint (used by Render for monitoring)
+// Health check endpoint
 app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'ok', 
-    timestamp: new Date().toISOString(),
-    environment: process.env.NODE_ENV || 'development',
-    shop: process.env.SHOPIFY_SHOP_NAME ? 'Configured' : 'Not configured',
-    platform: 'render',
-    uptime: process.uptime(),
-    memory: process.memoryUsage()
-  });
-});
-
-// Root endpoint
-app.get('/', (req, res) => {
   res.json({
-    message: 'Shopify Payment Capturer API',
-    version: '1.0.0',
-    endpoints: {
-      health: '/health',
-      webhooks: ['/webhooks/orders/create', '/webhooks/orders/updated'],
-      test: ['/test/shop', '/test/orders', '/test/permissions'],
-      documentation: 'See README for full API documentation'
-    }
+    status: 'healthy',
+    timestamp: new Date().toISOString(),
+    shop: process.env.SHOPIFY_SHOP_NAME,
+    uptime: process.uptime(),
+    memory: process.memoryUsage(),
+    node: process.version
   });
 });
 
-// Webhook endpoint for order creation/update
-app.post('/webhooks/orders/create', webhookController.handleOrderCreate);
-app.post('/webhooks/orders/updated', webhookController.handleOrderUpdate);
+// Simple ping endpoint for keep-alive
+app.get('/ping', (req, res) => {
+  res.status(200).send('pong');
+});
 
-// === TEST & DEBUG ENDPOINTS ===
+// Status page with auto-refresh
+app.get('/status', (req, res) => {
+  const html = `
+  <!DOCTYPE html>
+  <html>
+  <head>
+    <title>Shopify Payment Capturer - Status</title>
+    <meta http-equiv="refresh" content="300">
+    <style>
+      body { font-family: Arial, sans-serif; padding: 20px; max-width: 800px; margin: 0 auto; }
+      .status { padding: 15px; border-radius: 5px; margin: 20px 0; }
+      .up { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
+      .info { background: #d1ecf1; color: #0c5460; border: 1px solid #bee5eb; }
+      h1 { color: #333; }
+      .stats { background: #f8f9fa; padding: 15px; border-radius: 5px; }
+    </style>
+  </head>
+  <body>
+    <h1>🛍️ Shopify Payment Capturer</h1>
+    <div class="status up">
+      <h2>✅ Online - ${new Date().toISOString()}</h2>
+      <p>Server is running and accepting webhooks</p>
+    </div>
+    <div class="status info">
+      <h3>📊 System Information</h3>
+      <div class="stats">
+        <p><strong>Uptime:</strong> ${Math.floor(process.uptime())} seconds</p>
+        <p><strong>Node Version:</strong> ${process.version}</p>
+        <p><strong>Shop:</strong> ${process.env.SHOPIFY_SHOP_NAME || 'Not configured'}</p>
+        <p><strong>Environment:</strong> ${process.env.NODE_ENV || 'development'}</p>
+        <p><strong>Port:</strong> ${PORT}</p>
+      </div>
+    </div>
+    <div class="status info">
+      <h3>🔗 Useful Links</h3>
+      <ul>
+        <li><a href="/health">Health Check (JSON)</a></li>
+        <li><a href="/scheduled-jobs">View Scheduled Jobs</a></li>
+        <li><a href="/test/shop">Test Shopify Connection</a></li>
+        <li><a href="/test/orders">View Recent Orders</a></li>
+      </ul>
+    </div>
+  </body>
+  </html>
+  `;
+  res.send(html);
+});
 
-// Test endpoint to manually trigger token refresh
-app.get('/test-token', async (req, res) => {
+// Webhook endpoints
+app.post('/webhooks/orders/create', handleOrderCreate);
+app.post('/webhooks/orders/updated', handleOrderUpdate);
+
+// Test endpoints
+app.get('/test/shop', async (req, res) => {
   try {
-    const token = await shopifyService.refreshAccessToken();
-    res.json({ 
-      success: true, 
-      message: 'Token refreshed successfully',
-      tokenLength: token?.length || 0,
-      scopes: shopifyService.currentScopes
+    await shopifyService.refreshAccessToken();
+    res.json({
+      shop: process.env.SHOPIFY_SHOP_NAME,
+      connected: true,
+      timestamp: new Date().toISOString(),
+      scopes: 'read_all_orders,write_orders'
     });
   } catch (error) {
     res.status(500).json({ 
-      success: false, 
-      message: error.message,
-      shop: process.env.SHOPIFY_SHOP_NAME
-    });
-  }
-});
-
-// Test endpoint to verify API connection
-app.get('/test/shop', async (req, res) => {
-  try {
-    await shopifyService.ensureValidToken();
-    const response = await shopifyService.client.get('/shop.json');
-    res.json({
-      success: true,
-      shop: response.data.shop,
-      scopes: shopifyService.currentScopes,
-      environment: process.env.NODE_ENV
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
       error: error.message,
-      details: error.response?.data
+      connected: false 
     });
   }
 });
 
-// Test endpoint to list recent orders
 app.get('/test/orders', async (req, res) => {
   try {
-    await shopifyService.ensureValidToken();
-    const response = await shopifyService.client.get('/orders.json?limit=5&status=any');
+    const orders = await shopifyService.getRecentOrders(5);
     res.json({
-      success: true,
-      orderCount: response.data.orders?.length || 0,
-      orders: response.data.orders,
-      environment: process.env.NODE_ENV
+      count: orders.length,
+      orders: orders.map(order => ({
+        id: order.id,
+        name: order.name,
+        financial_status: order.financial_status,
+        note_attributes: order.note_attributes,
+        tags: order.tags,
+        created_at: order.created_at
+      }))
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      error: error.message,
-      details: error.response?.data
-    });
+    res.status(500).json({ error: error.message });
   }
 });
 
-// Test endpoint to verify transaction permissions
-app.get('/test/transactions/:orderId', async (req, res) => {
+// Debug endpoints
+app.get('/debug/order/:orderId', async (req, res) => {
   try {
     const orderId = req.params.orderId;
-    await shopifyService.ensureValidToken();
-    const response = await shopifyService.client.get(`/orders/${orderId}/transactions.json`);
-    res.json({
-      success: true,
-      orderId: orderId,
-      transactionCount: response.data.transactions?.length || 0,
-      transactions: response.data.transactions
-    });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      error: error.message,
-      details: error.response?.data
-    });
-  }
-});
-
-// Test endpoint to capture payment manually
-app.post('/test/capture/:orderId', async (req, res) => {
-  try {
-    const orderId = req.params.orderId;
+    console.log(`🔍 Debugging order: ${orderId}`);
     
-    console.log(`Attempting to capture payment for order ${orderId}`);
-    
-    // First, check if we have authorized transactions
+    const order = await shopifyService.getOrder(orderId);
     const transactions = await shopifyService.getOrderTransactions(orderId);
     
-    const authorizedTx = transactions.find(t => 
-      t.kind === 'authorization' && t.status === 'success' && !t.parent_id
-    );
-    
-    if (!authorizedTx) {
-      return res.json({
-        success: false,
-        message: 'No authorized transaction found to capture',
-        transactions: transactions
-      });
-    }
-    
-    console.log(`Found authorized transaction: ${authorizedTx.id}`);
-    
-    // Try to capture
-    const result = await shopifyService.capturePayment(orderId, authorizedTx.id);
-    
     res.json({
-      success: true,
-      message: 'Payment captured successfully',
-      transaction: result
+      order_id: orderId,
+      financial_status: order.financial_status,
+      note_attributes: order.note_attributes,
+      tags: order.tags,
+      line_items: order.line_items?.map(item => ({
+        name: item.name,
+        properties: item.properties
+      })),
+      transactions: transactions,
+      has_authorization: transactions.some(t => t.kind === 'authorization'),
+      has_successful_auth: transactions.some(t => t.kind === 'authorization' && t.status === 'success')
     });
-    
   } catch (error) {
-    console.error('Capture test failed:', error.message);
-    
-    if (error.response?.data?.errors === 'Required scope missing') {
-      res.status(403).json({
-        success: false,
-        error: 'Missing required scope',
-        message: 'Please check your app scopes and reinstall'
-      });
-    } else {
-      res.status(500).json({
-        success: false,
-        error: error.message,
-        details: error.response?.data
-      });
-    }
+    console.error('Debug error:', error);
+    res.status(500).json({ error: error.message });
   }
 });
 
-// Manual capture endpoint (works without read_orders scope)
-app.post('/manual-capture/:orderId', async (req, res) => {
+// Manual capture endpoint
+app.post('/debug/capture/:orderId', async (req, res) => {
   try {
     const orderId = req.params.orderId;
-    const { transactionId } = req.body;
+    console.log(`🔄 Manual capture for order: ${orderId}`);
     
-    if (!transactionId) {
-      return res.status(400).json({
-        success: false,
-        message: 'transactionId is required in request body'
+    const transactions = await shopifyService.getOrderTransactions(orderId);
+    const authTransaction = transactions.find(t => 
+      t.kind === 'authorization' && t.status === 'success'
+    );
+    
+    if (!authTransaction) {
+      return res.status(400).json({ 
+        error: 'No authorized transaction found',
+        transactions: transactions 
       });
     }
     
-    console.log(`Manual capture request for order ${orderId}, transaction ${transactionId}`);
-    
-    const result = await shopifyService.manualCapturePayment(orderId, transactionId);
+    const result = await shopifyService.capturePayment(orderId, authTransaction.id);
     
     res.json({
       success: true,
       message: 'Payment captured manually',
       transaction: result
     });
-    
   } catch (error) {
-    console.error('Manual capture failed:', error.message);
-    res.status(500).json({
-      success: false,
-      error: error.message,
-      note: 'You have write_orders scope, so you should be able to capture payments.'
-    });
+    console.error('Manual capture error:', error);
+    res.status(500).json({ error: error.message });
   }
 });
 
-// Test order read permission
-app.get('/test/permissions', async (req, res) => {
-  try {
-    const permissionTest = await shopifyService.testOrderReadPermission();
-    res.json(permissionTest);
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      error: error.message
-    });
-  }
+// Scheduled jobs endpoint
+app.get('/scheduled-jobs', (req, res) => {
+  const jobs = shopifyService.getScheduledJobs();
+  res.json({
+    count: jobs.length,
+    jobs: jobs,
+    timestamp: new Date().toISOString()
+  });
 });
 
-// Simulation endpoint for testing webhooks
-app.post('/simulate/order-webhook', async (req, res) => {
+// Manual schedule endpoint (for testing)
+app.post('/test-schedule/:orderId', async (req, res) => {
   try {
-    const { orderId, flag } = req.body;
+    const orderId = req.params.orderId;
+    const delay = req.query.delay || 120000; // Default 2 minutes
     
-    if (!orderId) {
-      return res.status(400).json({
-        success: false,
-        message: 'orderId is required'
+    console.log(`⏰ Manually scheduling capture for order ${orderId} in ${delay}ms`);
+    
+    const transactions = await shopifyService.getOrderTransactions(orderId);
+    const authTransaction = transactions.find(t => 
+      t.kind === 'authorization' && t.status === 'success'
+    );
+    
+    if (!authTransaction) {
+      return res.status(400).json({ 
+        error: 'No authorized transaction found',
+        transactions: transactions 
       });
     }
     
-    console.log(`Simulating webhook for order ${orderId} with flag: ${flag}`);
+    shopifyService.schedulePaymentCapture(orderId, authTransaction.id, parseInt(delay));
     
-    // Simulate the webhook processing
-    if (flag === 'buy_now') {
-      const result = await shopifyService.capturePaymentImmediately(orderId);
-      return res.json({
-        success: true,
-        message: `Order ${orderId} processed with buy_now flag`,
-        captured: !!result
-      });
-    } else if (flag === 'pay_later') {
-      const scheduledFor = new Date(Date.now() + (7 * 24 * 60 * 60 * 1000));
-      await scheduler.schedulePayment(orderId, scheduledFor);
-      return res.json({
-        success: true,
-        message: `Order ${orderId} scheduled for payment in 7 days`,
-        scheduledFor: scheduledFor.toISOString()
-      });
-    } else {
-      return res.json({
-        success: true,
-        message: `Order ${orderId} processed (no flag)`,
-        note: 'No payment flag found'
-      });
-    }
+    const jobs = shopifyService.getScheduledJobs();
     
-  } catch (error) {
-    console.error('Simulation error:', error.message);
-    res.status(500).json({
-      success: false,
-      error: error.message
+    res.json({
+      success: true,
+      message: `Payment capture scheduled for order ${orderId}`,
+      scheduledJobs: jobs,
+      captureIn: `${delay}ms`
     });
+  } catch (error) {
+    console.error('Schedule test error:', error);
+    res.status(500).json({ error: error.message });
   }
 });
 
-// === SERVER STARTUP ===
+// Start the scheduler
+shopifyService.startScheduler();
 
-// Use PORT provided by Render
-const PORT = process.env.PORT || 3000;
-
-app.listen(PORT, async () => {
+// Start server
+app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
-  console.log(`🏪 Shop name: ${process.env.SHOPIFY_SHOP_NAME || 'NOT SET'}`);
+  console.log(`🏪 Shop: ${process.env.SHOPIFY_SHOP_NAME || 'Not configured'}`);
   console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
-  console.log(`📡 Health check: http://localhost:${PORT}/health`);
+  console.log(`📡 Health: http://localhost:${PORT}/health`);
+  console.log(`📊 Status: http://localhost:${PORT}/status`);
   
-  // Start the scheduler for pay_later orders
-  try {
-    await scheduler.start();
-    console.log('✅ Payment scheduler started');
-    
-    // Note about Render free tier limitations
-    if (process.env.NODE_ENV === 'production' && process.env.RENDER) {
-      console.log('⚠️  NOTE: Render free tier instances sleep after 15 minutes of inactivity.');
-      console.log('⚠️  Scheduled payments may be delayed if the instance is sleeping.');
-      console.log('⚠️  Consider upgrading to a paid plan or using a cron service to ping the app.');
-    }
-  } catch (error) {
-    console.error('❌ Failed to start scheduler:', error.message);
-  }
-  
-  // Initial token fetch with retry
-  let retries = 3;
-  while (retries > 0) {
-    try {
-      console.log(`🔑 Attempting to obtain initial access token (${retries} retries left)...`);
-      await shopifyService.refreshAccessToken();
-      console.log('✅ Initial access token obtained successfully');
-      break;
-    } catch (error) {
-      retries--;
-      if (retries === 0) {
-        console.error('❌ Failed to obtain initial access token after all retries:', error.message);
-        console.log('⚠️  App will continue, but Shopify API calls may fail until token is obtained');
-      } else {
-        console.log(`⏳ Retrying in 5 seconds...`);
-        await new Promise(resolve => setTimeout(resolve, 5000));
-      }
-    }
-  }
-  
-  console.log('✅ App is fully initialized and ready!');
-  console.log('📝 API Documentation:');
-  console.log('   • GET  /health - Health check');
-  console.log('   • POST /webhooks/orders/create - Order creation webhook');
-  console.log('   • POST /webhooks/orders/updated - Order update webhook');
-  console.log('   • GET  /test/shop - Test Shopify connection');
-  console.log('   • GET  /test/orders - List recent orders');
+  // Refresh access token on startup
+  shopifyService.refreshAccessToken().catch(error => {
+    console.error('Failed to refresh access token on startup:', error.message);
+  });
 });
 
-// === ERROR HANDLING ===
-
-// Handle uncaught exceptions
-process.on('uncaughtException', (error) => {
-  console.error('🔥 UNCAUGHT EXCEPTION:', error);
-  console.error('Stack trace:', error.stack);
-});
-
-// Handle unhandled promise rejections
-process.on('unhandledRejection', (reason, promise) => {
-  console.error('🔥 UNHANDLED REJECTION at:', promise);
-  console.error('Reason:', reason);
-});
-
-// Graceful shutdown handler
+// Handle graceful shutdown
 process.on('SIGTERM', () => {
-  console.log('🛑 SIGTERM received. Shutting down gracefully...');
-  // Clean up scheduler jobs if needed
+  console.log('SIGTERM received. Shutting down gracefully...');
   process.exit(0);
 });
 
 process.on('SIGINT', () => {
-  console.log('🛑 SIGINT received. Shutting down gracefully...');
+  console.log('SIGINT received. Shutting down gracefully...');
   process.exit(0);
 });
+
+module.exports = app; // For testing

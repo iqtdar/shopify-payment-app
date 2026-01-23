@@ -1,84 +1,66 @@
 const axios = require('axios');
+const fs = require('fs').promises;
+const path = require('path');
 
 class ShopifyService {
   constructor() {
     this.accessToken = null;
     this.tokenExpiry = null;
-    this.currentScopes = null;
-    this.shop = process.env.SHOPIFY_SHOP_NAME?.trim();
-    this.clientId = process.env.SHOPIFY_CLIENT_ID?.trim();
-    this.clientSecret = process.env.SHOPIFY_CLIENT_SECRET?.trim();
+    this.shop = process.env.SHOPIFY_SHOP_NAME;
+    this.clientId = process.env.SHOPIFY_CLIENT_ID;
+    this.clientSecret = process.env.SHOPIFY_CLIENT_SECRET;
     this.apiVersion = '2024-01';
+    this.scheduledJobs = [];
+    this.isSchedulerRunning = false;
+    this.payLaterDelay = (process.env.PAY_LATER_DELAY_MINUTES || 30) * 60 * 1000;
     
-    // Debug logging
-    console.log('Shopify Service initialized with shop:', this.shop);
-    this.validateConfig();
+    // Create logs directory
+    this.logsDir = path.join(__dirname, '../logs');
+    this.ensureLogsDirectory();
   }
 
-  validateConfig() {
-    console.log('\n=== Shopify Configuration Check ===');
-    console.log('Shop:', this.shop || '❌ MISSING');
-    console.log('Client ID:', this.clientId ? '✅ Present' : '❌ MISSING');
-    console.log('Client Secret:', this.clientSecret ? '✅ Present' : '❌ MISSING');
+  async ensureLogsDirectory() {
+    try {
+      await fs.mkdir(this.logsDir, { recursive: true });
+    } catch (error) {
+      console.error('Failed to create logs directory:', error.message);
+    }
+  }
+
+  logToFile(message) {
+    const logFile = path.join(this.logsDir, 'shopify-service.log');
+    const timestamp = new Date().toISOString();
+    const logMessage = `[${timestamp}] ${message}\n`;
     
-    if (!this.shop) {
-      throw new Error('SHOPIFY_SHOP_NAME is not set in .env file');
-    }
-    if (!this.clientId) {
-      throw new Error('SHOPIFY_CLIENT_ID is not set in .env file');
-    }
-    if (!this.clientSecret) {
-      throw new Error('SHOPIFY_CLIENT_SECRET is not set in .env file');
-    }
-    
-    // Remove any trailing slashes or .myshopify.com
-    this.shop = this.shop.replace('.myshopify.com', '').replace(/\/$/, '');
-    console.log('Cleaned shop name:', this.shop);
-    console.log('==============================\n');
+    fs.appendFile(logFile, logMessage).catch(() => {
+      // Silently fail if we can't write to log file
+    });
   }
 
   initializeClient() {
-    if (!this.shop) {
-      throw new Error('Shop name is not defined');
-    }
-    
-    const baseURL = `https://${this.shop}.myshopify.com/admin/api/${this.apiVersion}`;
-    console.log('Initializing Shopify client with base URL:', baseURL);
-    
-    this.client = axios.create({
-      baseURL: baseURL,
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      timeout: 10000,
-    });
+    console.log('Initializing Shopify client for:', this.shop);
+    this.logToFile(`Initializing Shopify client for: ${this.shop}`);
 
-    // Add request interceptor to include access token
-    this.client.interceptors.request.use(
-      async (config) => {
-        await this.ensureValidToken();
-        config.headers['X-Shopify-Access-Token'] = this.accessToken;
-        return config;
-      },
-      (error) => Promise.reject(error)
-    );
+    if (!this.shop) {
+      throw new Error('SHOPIFY_SHOP_NAME is not set in environment variables');
+    }
+
+    this.baseURL = `https://${this.shop}.myshopify.com/admin/api/${this.apiVersion}`;
+    console.log('✅ Shopify client configured');
+    this.logToFile('Shopify client configured successfully');
   }
 
   async refreshAccessToken() {
     try {
-      // Debug: Check what we're sending
-      console.log('Attempting to refresh token for shop:', this.shop);
-      console.log('Using client ID:', this.clientId ? 'Present' : 'Missing');
-      
-      if (!this.shop) {
-        throw new Error('Shop name is not defined');
+      console.log('Refreshing access token...');
+      this.logToFile('Refreshing access token');
+
+      if (!this.shop || !this.clientId || !this.clientSecret) {
+        throw new Error('Missing Shopify configuration');
       }
-      
-      const tokenUrl = `https://${this.shop}.myshopify.com/admin/oauth/access_token`;
-      console.log('Token URL:', tokenUrl);
-      
+
       const response = await axios.post(
-        tokenUrl,
+        `https://${this.shop}.myshopify.com/admin/oauth/access_token`,
         new URLSearchParams({
           client_id: this.clientId,
           client_secret: this.clientSecret,
@@ -88,27 +70,32 @@ class ShopifyService {
           headers: {
             'Content-Type': 'application/x-www-form-urlencoded',
           },
+          timeout: 10000 // 10 second timeout
         }
       );
 
       this.accessToken = response.data.access_token;
-      this.tokenExpiry = new Date(Date.now() + (response.data.expires_in * 1000));
-      this.currentScopes = response.data.scope;
-      
-      console.log('Access token refreshed successfully');
-      console.log('Token expires in:', response.data.expires_in, 'seconds');
+      this.tokenExpiry = new Date(Date.now() + response.data.expires_in * 1000);
+
+      this.client = axios.create({
+        baseURL: this.baseURL,
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Shopify-Access-Token': this.accessToken,
+          'User-Agent': 'Shopify-Payment-Capturer/1.0'
+        },
+        timeout: 30000 // 30 second timeout for Shopify API
+      });
+
+      console.log('✅ Access token refreshed successfully');
       console.log('Scopes:', response.data.scope);
-      
-      // Verify scopes after token refresh
-      await this.verifyScopes();
+      this.logToFile(`Access token refreshed. Scopes: ${response.data.scope}`);
       
       return this.accessToken;
     } catch (error) {
-      console.error('Error refreshing access token:');
-      console.error('Error message:', error.message);
-      console.error('Error code:', error.code);
-      console.error('Shop name from env:', this.shop);
-      
+      const errorMsg = `Error refreshing access token: ${error.message}`;
+      console.error('❌', errorMsg);
+      this.logToFile(`ERROR: ${errorMsg}`);
       if (error.response) {
         console.error('Response status:', error.response.status);
         console.error('Response data:', error.response.data);
@@ -117,66 +104,15 @@ class ShopifyService {
     }
   }
 
-  // Update the verifyScopes method in shopify.js:
-
-// Replace the entire verifyScopes method with this:
-
-async verifyScopes() {
-  try {
-    // Required scopes for our app
-    const requiredScopes = [
-      'write_orders',   // This includes permission to capture payments (transactions) for orders
-      'read_orders',    // For reading order details and checking flags
-    ];
-    
-    console.log('\n=== Scope Verification ===');
-    console.log('Required scopes:', requiredScopes);
-    
-    // The scope is returned as a comma-separated string
-    const grantedScopes = this.currentScopes ? this.currentScopes.split(',').map(s => s.trim()) : [];
-    console.log('Granted scopes:', grantedScopes);
-    
-    // Check if we have the required scopes or their equivalents
-    const hasWriteOrders = grantedScopes.includes('write_orders');
-    
-    // read_all_orders includes read_orders and more
-    const hasReadOrders = grantedScopes.includes('read_orders') || grantedScopes.includes('read_all_orders');
-    
-    const missingScopes = [];
-    if (!hasWriteOrders) missingScopes.push('write_orders');
-    if (!hasReadOrders) missingScopes.push('read_orders (or read_all_orders)');
-    
-    if (missingScopes.length > 0) {
-      console.warn('⚠️ MISSING SCOPES:', missingScopes);
-      console.warn('\n🔧 HOW TO FIX:');
-      console.warn('1. Go to Shopify Partner Dashboard → Apps → Your App');
-      console.warn('2. Click "App setup" → "Admin API integration"');
-      console.warn('3. Under "Orders" section, check the required scopes');
-      console.warn('4. Click "Save"');
-      console.warn('5. Reinstall the app in your store');
-      console.warn('6. Restart this server\n');
-    } else {
-      console.log('✅ All required scopes are granted!');
-      if (grantedScopes.includes('read_all_orders')) {
-        console.log('🎉 BONUS: You have read_all_orders (even better than read_orders!)');
-      }
-      console.log('Note: With write_orders scope, you can capture payments on orders.');
-    }
-    
-    return missingScopes;
-  } catch (error) {
-    console.error('Error verifying scopes:', error.message);
-    return ['error'];
-  }
-}
-
   async ensureValidToken() {
-    if (!this.accessToken || !this.tokenExpiry || this.tokenExpiry < new Date(Date.now() - 300000)) { // 5 minute buffer
+    if (
+      !this.accessToken ||
+      !this.tokenExpiry ||
+      this.tokenExpiry < new Date(Date.now() - 300000) // Refresh if expires in 5 minutes
+    ) {
       console.log('Token expired or about to expire, refreshing...');
+      this.logToFile('Token needs refresh');
       await this.refreshAccessToken();
-    } else {
-      const remaining = Math.floor((this.tokenExpiry - new Date()) / 1000 / 60);
-      console.log(`Token valid for ${remaining} more minutes`);
     }
   }
 
@@ -186,13 +122,9 @@ async verifyScopes() {
       const response = await this.client.get(`/orders/${orderId}.json`);
       return response.data.order;
     } catch (error) {
-      if (error.response?.status === 403) {
-        const errorMsg = `Permission denied reading order ${orderId}. Missing "read_orders" scope.`;
-        console.error(`❌ ${errorMsg}`);
-        console.error('Please add "read_orders" scope to your app and reinstall.');
-        throw new Error(errorMsg);
-      }
-      console.error(`Error fetching order ${orderId}:`, error.response?.data || error.message);
+      const errorMsg = `Error fetching order ${orderId}: ${error.message}`;
+      console.error(errorMsg);
+      this.logToFile(`ERROR: ${errorMsg}`);
       throw error;
     }
   }
@@ -200,15 +132,29 @@ async verifyScopes() {
   async capturePayment(orderId, transactionId) {
     try {
       await this.ensureValidToken();
-      const response = await this.client.post(`/orders/${orderId}/transactions.json`, {
-        transaction: {
-          kind: 'capture',
-          parent_id: transactionId,
-        },
-      });
+      const response = await this.client.post(
+        `/orders/${orderId}/transactions.json`,
+        {
+          transaction: {
+            kind: 'capture',
+            parent_id: transactionId,
+            amount: null // Capture full amount
+          },
+        }
+      );
+      
+      const successMsg = `✅ Payment captured for order ${orderId}, transaction ${transactionId}`;
+      console.log(successMsg);
+      this.logToFile(successMsg);
+      
       return response.data.transaction;
     } catch (error) {
-      console.error(`Error capturing payment for order ${orderId}:`, error.response?.data || error.message);
+      const errorMsg = `Error capturing payment for order ${orderId}: ${error.message}`;
+      console.error(errorMsg);
+      this.logToFile(`ERROR: ${errorMsg}`);
+      if (error.response) {
+        console.error('Error response:', error.response.data);
+      }
       throw error;
     }
   }
@@ -216,168 +162,222 @@ async verifyScopes() {
   async getOrderTransactions(orderId) {
     try {
       await this.ensureValidToken();
-      const response = await this.client.get(`/orders/${orderId}/transactions.json`);
+      const response = await this.client.get(
+        `/orders/${orderId}/transactions.json`
+      );
       return response.data.transactions;
     } catch (error) {
-      if (error.response?.status === 403) {
-        const errorMsg = `Permission denied reading transactions for order ${orderId}. Missing "read_orders" scope.`;
-        console.error(`❌ ${errorMsg}`);
-        throw new Error(errorMsg);
-      }
-      console.error(`Error fetching transactions for order ${orderId}:`, error.response?.data || error.message);
+      const errorMsg = `Error fetching transactions for order ${orderId}: ${error.message}`;
+      console.error(errorMsg);
+      this.logToFile(`ERROR: ${errorMsg}`);
       throw error;
     }
   }
 
-  async getAuthorizedTransaction(orderId) {
-    try {
-      const transactions = await this.getOrderTransactions(orderId);
-      return transactions.find(t => 
-        t.kind === 'authorization' && 
-        t.status === 'success' &&
-        !t.parent_id // Not already captured
-      );
-    } catch (error) {
-      // If we get a permission error, we can't check for authorized transactions
-      console.error(`Cannot check authorized transactions for order ${orderId}:`, error.message);
-      return null;
-    }
-  }
-
-  hasFlag(order, flagName) {
-    if (!order) return false;
-    
-    // Check in note attributes
-    if (order.note_attributes) {
-      const flagAttr = order.note_attributes.find(attr => 
-        attr.name === 'payment_flag' && attr.value === flagName
-      );
-      if (flagAttr) return true;
-    }
-
-    // Check in metafields (if using metafields)
-    if (order.metafields) {
-      const flagMetafield = order.metafields.find(meta => 
-        meta.key === 'payment_flag' && meta.value === flagName
-      );
-      if (flagMetafield) return true;
-    }
-
-    // Check in tags
-    if (order.tags && order.tags.includes(flagName)) {
-      return true;
-    }
-
-    // Check in custom attributes
-    if (order.custom_attributes) {
-      const flagCustom = order.custom_attributes.find(attr => 
-        attr.key === 'payment_flag' && attr.value === flagName
-      );
-      if (flagCustom) return true;
-    }
-
-    return false;
-  }
-
-  async processOrder(orderId) {
-    try {
-      const order = await this.getOrder(orderId);
-      
-      // Check for buy_now flag
-      if (this.hasFlag(order, 'buy_now')) {
-        console.log(`Processing buy_now order: ${orderId}`);
-        const result = await this.capturePaymentImmediately(orderId);
-        return { orderId, flag: 'buy_now', captured: !!result };
-      }
-      // Check for pay_later flag
-      else if (this.hasFlag(order, 'pay_later')) {
-        console.log(`Scheduling pay_later order: ${orderId} for 7 days later`);
-        // This will be handled by the scheduler
-        return {
-          orderId,
-          flag: 'pay_later',
-          scheduledFor: new Date(Date.now() + (7 * 24 * 60 * 60 * 1000)),
-        };
-      } else {
-        console.log(`No payment flag found for order ${orderId}`);
-        return null;
-      }
-    } catch (error) {
-      if (error.message.includes('Missing "read_orders" scope')) {
-        console.warn(`⚠️ Cannot process order ${orderId} automatically: Missing read_orders scope`);
-        console.warn('Please add read_orders scope to enable automatic flag detection');
-        return { orderId, error: 'missing_read_scope', message: error.message };
-      }
-      console.error(`Error processing order ${orderId}:`, error.message);
-      throw error;
-    }
-  }
-
-  async capturePaymentImmediately(orderId) {
-    try {
-      const authorizedTransaction = await this.getAuthorizedTransaction(orderId);
-      
-      if (!authorizedTransaction) {
-        console.log(`No authorized transaction found for order ${orderId}`);
-        return null;
-      }
-
-      console.log(`Capturing payment for order ${orderId}, transaction ${authorizedTransaction.id}`);
-      return await this.capturePayment(orderId, authorizedTransaction.id);
-    } catch (error) {
-      console.error(`Error capturing payment immediately for order ${orderId}:`, error.message);
-      throw error;
-    }
-  }
-
-  async capturePaymentForOrder(orderId) {
-    return await this.capturePaymentImmediately(orderId);
-  }
-
-  // Helper method to get shop info (doesn't require read_orders)
-  async getShopInfo() {
+  async getRecentOrders(limit = 5) {
     try {
       await this.ensureValidToken();
-      const response = await this.client.get('/shop.json');
-      return response.data.shop;
+      const response = await this.client.get(
+        `/orders.json?limit=${limit}&status=any&order=created_at desc`
+      );
+      return response.data.orders || [];
     } catch (error) {
-      console.error('Error fetching shop info:', error.response?.data || error.message);
-      throw error;
+      const errorMsg = `Error fetching recent orders: ${error.message}`;
+      console.error(errorMsg);
+      this.logToFile(`ERROR: ${errorMsg}`);
+      return [];
     }
   }
 
-  // Test method to check if we can read orders
-async testOrderReadPermission() {
-  try {
-    await this.ensureValidToken();
-    const response = await this.client.get('/orders.json?limit=1');
-    return {
-      success: true,
-      hasPermission: true,
-      permission: 'read_all_orders', // Specify which permission we have
-      orderCount: response.data.orders?.length || 0
-    };
-  } catch (error) {
-    if (error.response?.status === 403) {
-      return {
-        success: false,
-        hasPermission: false,
-        error: 'Missing read_orders or read_all_orders scope. Please add this scope in your app configuration.'
-      };
-    }
-    throw error;
-  }
-}
-
-  // Manual capture without checking flags (for testing without read_orders)
-  async manualCapturePayment(orderId, transactionId) {
+  async processOrder(orderData) {
     try {
-      console.log(`Manually capturing payment for order ${orderId}, transaction ${transactionId}`);
-      return await this.capturePayment(orderId, transactionId);
+      console.log(`🎯 Processing order: ${orderData.id}`);
+      this.logToFile(`Processing order: ${orderData.id}`);
+
+      // Fetch the full order
+      const order = await this.getOrder(orderData.id);
+      
+      console.log('🔍 Checking for payment flag...');
+      
+      // Check multiple places for payment flag
+      let paymentFlag = null;
+      
+      // 1. Check note attributes
+      const noteAttributes = order.note_attributes || [];
+      const paymentFlagAttr = noteAttributes.find(attr => {
+        const name = attr.name ? attr.name.toLowerCase() : '';
+        return name === 'payment_flag' || name === 'purchase_type';
+      });
+      
+      if (paymentFlagAttr) {
+        paymentFlag = paymentFlagAttr.value.toLowerCase();
+        console.log(`✅ Found payment flag in note attributes: ${paymentFlag}`);
+      }
+      
+      // 2. Check line item properties
+      if (!paymentFlag && order.line_items && order.line_items.length > 0) {
+        for (const lineItem of order.line_items) {
+          if (lineItem.properties && lineItem.properties.length > 0) {
+            const prop = lineItem.properties.find(p => {
+              const name = p.name ? p.name.toLowerCase() : '';
+              return name === 'payment_flag' || name === 'purchase_type';
+            });
+            if (prop) {
+              paymentFlag = prop.value.toLowerCase();
+              console.log(`✅ Found payment flag in line item properties: ${paymentFlag}`);
+              break;
+            }
+          }
+        }
+      }
+      
+      // 3. Check tags
+      if (!paymentFlag && order.tags) {
+        const tags = order.tags.toLowerCase();
+        if (tags.includes('buy_now')) {
+          paymentFlag = 'buy_now';
+          console.log('✅ Found buy_now tag');
+        } else if (tags.includes('pay_later')) {
+          paymentFlag = 'pay_later';
+          console.log('✅ Found pay_later tag');
+        }
+      }
+
+      if (!paymentFlag) {
+        console.log(`ℹ️ No payment flag found for order ${order.id}`);
+        this.logToFile(`No payment flag found for order ${order.id}`);
+        return;
+      }
+
+      // Get transactions
+      const transactions = await this.getOrderTransactions(order.id);
+      const authTransaction = transactions.find(t => 
+        t.kind === 'authorization' && t.status === 'success'
+      );
+
+      if (!authTransaction) {
+        console.log(`⚠️ No authorized transaction found for order ${order.id}`);
+        this.logToFile(`No authorized transaction for order ${order.id}`);
+        return;
+      }
+
+      const transactionId = authTransaction.id;
+      console.log(`✅ Found authorized transaction: ${transactionId}`);
+
+      if (paymentFlag === 'buy_now') {
+        console.log(`💰 Processing buy_now for order ${order.id}`);
+        this.logToFile(`Processing buy_now for order ${order.id}`);
+        
+        try {
+          await this.capturePayment(order.id, transactionId);
+        } catch (error) {
+          console.error(`❌ Buy now capture failed: ${error.message}`);
+          this.logToFile(`Buy now capture failed: ${error.message}`);
+        }
+      } else if (paymentFlag === 'pay_later') {
+        console.log(`⏰ Processing pay_later for order ${order.id}, scheduling capture in ${this.payLaterDelay / 60000} minutes`);
+        this.logToFile(`Scheduling pay_later capture for order ${order.id}`);
+        
+        this.schedulePaymentCapture(order.id, transactionId, this.payLaterDelay);
+      } else {
+        console.log(`❓ Unknown payment flag: ${paymentFlag}`);
+        this.logToFile(`Unknown payment flag: ${paymentFlag}`);
+      }
+
     } catch (error) {
-      console.error(`Manual capture failed for order ${orderId}:`, error.message);
+      const errorMsg = `Error processing order ${orderData.id}: ${error.message}`;
+      console.error(errorMsg);
+      this.logToFile(`ERROR: ${errorMsg}`);
       throw error;
     }
+  }
+
+  schedulePaymentCapture(orderId, transactionId, delay) {
+    console.log(`⏰ Scheduling payment capture for order ${orderId} in ${delay}ms`);
+    this.logToFile(`Scheduling payment capture for order ${orderId}`);
+    
+    const scheduledTime = Date.now() + delay;
+    
+    const job = {
+      orderId,
+      transactionId,
+      scheduledTime,
+      jobId: null
+    };
+    
+    job.jobId = setTimeout(async () => {
+      try {
+        console.log(`🔔 Executing scheduled payment capture for order ${orderId}`);
+        this.logToFile(`Executing scheduled capture for order ${orderId}`);
+        
+        await this.capturePayment(orderId, transactionId);
+        
+        this.removeScheduledJob(orderId);
+      } catch (error) {
+        console.error(`❌ Scheduled capture failed: ${error.message}`);
+        this.logToFile(`Scheduled capture failed: ${error.message}`);
+      }
+    }, delay);
+    
+    this.scheduledJobs.push(job);
+    console.log(`📅 Scheduled job added. Total jobs: ${this.scheduledJobs.length}`);
+  }
+
+  removeScheduledJob(orderId) {
+    const index = this.scheduledJobs.findIndex(j => j.orderId === orderId);
+    if (index > -1) {
+      clearTimeout(this.scheduledJobs[index].jobId);
+      this.scheduledJobs.splice(index, 1);
+      console.log(`🗑️ Removed scheduled job for order ${orderId}`);
+      this.logToFile(`Removed scheduled job for order ${orderId}`);
+    }
+  }
+
+  getScheduledJobs() {
+    return this.scheduledJobs.map(job => {
+      const timeLeft = job.scheduledTime - Date.now();
+      const minutes = Math.floor(timeLeft / (1000 * 60));
+      const seconds = Math.floor((timeLeft % (1000 * 60)) / 1000);
+      
+      return {
+        orderId: job.orderId,
+        scheduledTime: new Date(job.scheduledTime).toISOString(),
+        timeLeft: `${minutes}m ${seconds}s`,
+        timeLeftMs: timeLeft
+      };
+    });
+  }
+
+  startScheduler() {
+    if (this.isSchedulerRunning) return;
+    
+    console.log('🚀 Starting payment capture scheduler...');
+    this.logToFile('Starting payment capture scheduler');
+    this.isSchedulerRunning = true;
+    
+    // Check every minute for overdue jobs
+    setInterval(() => {
+      const now = Date.now();
+      this.scheduledJobs.forEach(job => {
+        if (job.scheduledTime <= now && job.jobId) {
+          console.log(`⏰ Job for order ${job.orderId} is overdue, executing now...`);
+          this.logToFile(`Overdue job detected for order ${job.orderId}`);
+          
+          clearTimeout(job.jobId);
+          
+          this.capturePayment(job.orderId, job.transactionId)
+            .then(() => {
+              console.log(`✅ Overdue job completed for order ${job.orderId}`);
+              this.logToFile(`Overdue job completed for order ${job.orderId}`);
+              this.removeScheduledJob(job.orderId);
+            })
+            .catch(error => {
+              console.error(`❌ Failed overdue job: ${error.message}`);
+              this.logToFile(`Failed overdue job: ${error.message}`);
+            });
+        }
+      });
+    }, 60000); // Check every minute
   }
 }
 
